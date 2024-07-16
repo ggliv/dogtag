@@ -17,7 +17,7 @@ pub struct Course {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Section {
-    pub crn: String,
+    pub crn: usize,
     pub instructors: HashSet<String>,
     pub schedule: Vec<ScheduleItem>,
 }

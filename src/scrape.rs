@@ -42,7 +42,7 @@ pub async fn parse(doc: Html, term: String) -> Result<HashMap<String, Subject>> 
         };
 
         let section = Section {
-            crn: crn.into(),
+            crn: crn.parse()?,
             instructors,
             schedule,
         };
