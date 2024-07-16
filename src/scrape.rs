@@ -1,7 +1,7 @@
 use crate::structs::*;
-use config::Config;
+
 use regex::Regex;
-use reqwest::{Client, ClientBuilder, Method};
+use reqwest::Client;
 use scraper::{Html, Selector};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -31,7 +31,6 @@ pub async fn parse(
             .inner_html();
 
         let (title, crn, subj, code) = parse_line(&line)?;
-        let (desc, credits) = get_course_catalog(&client, &term, subj, code).await?;
 
         let (schedules, instructors) = match body.select(&sched_sel).next() {
             Some(sched_table) => parse_sched_table(sched_table)?,
@@ -44,7 +43,7 @@ pub async fn parse(
             schedules,
         };
 
-        map.entry(subj.into())
+        let courses = &mut map.entry(subj.into())
             .or_insert_with(|| {
                 Subject {
                     // TODO use actual subject title
@@ -52,30 +51,26 @@ pub async fn parse(
                     courses: HashMap::new(),
                 }
             })
-            .courses
-            .entry(code.into())
-            .or_insert_with(|| Course {
-                title: title.into(),
-                description: desc,
-                credits,
-                sections: Vec::new(),
-            })
+            .courses;
+
+        // we have to do this instead of the more elegant element(...).or_insert_with(...)
+        // because of our async catalog request
+        if !courses.contains_key(code) {
+            let (description, credits) = get_course_catalog(&client, &term, subj, code).await?;
+            courses.insert(code.into(), Course {
+                    title: title.into(),
+                    description,
+                    credits,
+                    sections: Vec::new(),
+                });
+        }
+
+        courses.get_mut(code).unwrap()
             .sections
             .push(section);
     }
 
     Ok(map)
-}
-
-fn parse_line<'a>(line: &'a str) -> Result<(&'a str, &'a str, &'a str, &'a str)> {
-    let line_re = Regex::new(r"(.*) - (\d{5}) - ([A-Z]{4}) (\d{4}[A-Z]?) - .*")?;
-    let caps = line_re.captures(line).ok_or("line parse")?;
-    Ok((
-        caps.get(1).ok_or("line parse")?.as_str(),
-        caps.get(2).ok_or("line parse")?.as_str(),
-        caps.get(3).ok_or("line parse")?.as_str(),
-        caps.get(4).ok_or("line parse")?.as_str(),
-    ))
 }
 
 pub async fn get_course_catalog(
@@ -100,22 +95,34 @@ pub async fn get_course_catalog(
         "table[summary='This table lists the course detail for the selected term.'] td.ntdefault",
     )?;
     let body = doc.select(&body_sel).next().ok_or("body")?.inner_html();
-    let mut chunks = body.split("<br>");
+    let br_re = Regex::new(r"<\s*br\s*\\?\s*>")?;
+    let mut chunks = br_re.split(&body);
     let desc = chunks.next().ok_or("desc")?.trim();
     let credits = {
         let cred_line = chunks.next().ok_or("credits")?;
-        let cred_range_re = Regex::new(r".*(\d+\.\d+) TO (\d+\.\d+) Credit hours.*")?;
-        let cred_single_re = Regex::new(r".*(\d+\.\d+) Credit hours.*")?;
+        let cred_range_re = Regex::new(r".*(\d+\.\d+)\s+TO\s+(\d+\.\d+) Credit hours.*")?;
+        let cred_single_re = Regex::new(r".*(\d+\.\d+)\s+Credit hours.*")?;
         if let Some(caps) = cred_range_re.captures(cred_line) {
             (caps[1].into(), caps[2].into())
         } else if let Some(caps) = cred_single_re.captures(cred_line) {
             (caps[1].into(), caps[1].into())
         } else {
-            Err("credits")?
+            Err("credits: no match")?
         }
     };
 
     Ok((desc.into(), credits))
+}
+
+fn parse_line(line: &str) -> Result<(&str, &str, &str, &str)> {
+    let line_re = Regex::new(r"(.*) - (\d{5}) - ([A-Z]{4}) (\d{4}[A-Z]?) - .*")?;
+    let caps = line_re.captures(line).ok_or("line parse")?;
+    Ok((
+        caps.get(1).ok_or("line parse")?.as_str(),
+        caps.get(2).ok_or("line parse")?.as_str(),
+        caps.get(3).ok_or("line parse")?.as_str(),
+        caps.get(4).ok_or("line parse")?.as_str(),
+    ))
 }
 
 fn parse_sched_table(sched_table: scraper::ElementRef) -> Result<(Vec<Schedule>, HashSet<String>)> {
@@ -144,71 +151,4 @@ fn parse_sched_table(sched_table: scraper::ElementRef) -> Result<(Vec<Schedule>,
     }
 
     Ok((schedules, instructors))
-}
-
-struct Context {
-    config: Config,
-    client: Client,
-    subjects: Option<Vec<Subject>>,
-}
-
-impl Context {
-    pub async fn init(config: config::Config) -> Result<Self> {
-        let client = ClientBuilder::new().gzip(true).cookie_store(true).build()?;
-
-        // make an initial request to the home page to populate the cookie jar
-        client.get(config.get_string("home_url")?).send().await?;
-
-        Ok(Self {
-            config,
-            client,
-            subjects: None,
-        })
-    }
-
-    async fn req_and_parse(&self, method: Method, url: impl Into<String>) -> Result<Html> {
-        let res = self
-            .client
-            .request(method, url.into())
-            .send()
-            .await?
-            .text()
-            .await?;
-        let doc = Html::parse_document(&res);
-        Ok(doc)
-    }
-
-    pub async fn get_subjects(&mut self) -> Result<()> {
-        let target_term = self.config.get_string("term")?;
-        let doc = self
-            .req_and_parse(Method::GET, self.config.get_string("home_url")?)
-            .await?;
-        let term_form_sel = Selector::parse(".pagebodydiv > form")?;
-        let form_input_sel = Selector::parse(":scope input")?;
-        let term_opts_sel = Selector::parse(":scope option")?;
-        let post_target = doc
-            .select(&term_form_sel)
-            .next()
-            .ok_or("couldn't find terms form")?
-            .attr("action")
-            .ok_or("couldn't find terms form target")?;
-        let ref_kvp = {
-            let input = doc
-                .select(&form_input_sel)
-                .next()
-                .ok_or("couldn't find form input")?;
-            let name = input.attr("name").ok_or("couldn't find input name")?;
-            let value = input.attr("value").ok_or("couldn't find input value")?;
-            (name, value)
-        };
-        let term_code = doc
-            .select(&term_opts_sel)
-            .filter(|t| t.inner_html() == target_term)
-            .next()
-            .ok_or("couldn't find requested term")?
-            .attr("value")
-            .ok_or("couldn't get terms value code")?;
-
-        Err("couldn't find requested term".into())
-    }
 }

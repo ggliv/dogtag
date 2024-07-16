@@ -6,7 +6,7 @@ use std::error::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let config = Config::builder()
+    let _config = Config::builder()
         .add_source(Environment::with_prefix("DT"))
         .build()?;
     let html = std::fs::read_to_string("/home/ggliv/Downloads/csci_catalog.html")?;
