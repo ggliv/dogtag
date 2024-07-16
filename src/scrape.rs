@@ -158,8 +158,8 @@ fn parse_sched_table(sched_table: scraper::ElementRef) -> Result<(Vec<Schedule>,
         let mut cols = row.select(&col_sel).skip(1);
         let time = cols.next().ok_or("time")?.inner_html();
         let (time_start, time_end) = time.split_once(" - ").ok_or("time split")?;
-        let days = cols.next().ok_or("days")?.inner_html();
-        let location = cols.next().ok_or("location")?.inner_html();
+        let days = cols.next().ok_or("days")?.inner_html().decode();
+        let location = cols.next().ok_or("location")?.inner_html().decode();
         schedules.push(Schedule {
             times: (time_start.into(), time_end.into()),
             days,
@@ -174,4 +174,16 @@ fn parse_sched_table(sched_table: scraper::ElementRef) -> Result<(Vec<Schedule>,
     }
 
     Ok((schedules, instructors))
+}
+
+trait DecodeHtmlEntities {
+    // deal with some html entities we encounter in the output
+    fn decode(self) -> String;
+}
+
+impl<T: Into<String>> DecodeHtmlEntities for T {
+    fn decode(self) -> String {
+        // chained replace isn't terribly efficient but I don't think it matters here
+        self.into().replace("&amp;", "&").replace("&nbsp;", " ")
+    }
 }
