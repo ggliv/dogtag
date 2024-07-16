@@ -19,12 +19,12 @@ pub struct Course {
 pub struct Section {
     pub crn: String,
     pub instructors: HashSet<String>,
-    pub schedules: Vec<Schedule>,
+    pub schedule: Vec<ScheduleItem>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Schedule {
-    pub times: (String, String),
+pub struct ScheduleItem {
+    pub time: (String, String),
     pub days: Vec<char>,
     pub location: String,
 }

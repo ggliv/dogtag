@@ -11,7 +11,6 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 pub async fn parse(
     doc: Html,
     term: String,
-    //subject_titles: HashMap<String, String>,
 ) -> Result<HashMap<String, Subject>> {
     let mut map = HashMap::new();
     let client = Client::builder().gzip(true).build()?;
@@ -33,7 +32,7 @@ pub async fn parse(
 
         let (title, crn, subj, code) = parse_line(&line)?;
 
-        let (schedules, instructors) = match body.select(&sched_sel).next() {
+        let (schedule, instructors) = match body.select(&sched_sel).next() {
             Some(sched_table) => parse_sched_table(sched_table)?,
             None => (Vec::new(), HashSet::new()),
         };
@@ -41,7 +40,7 @@ pub async fn parse(
         let section = Section {
             crn: crn.into(),
             instructors,
-            schedules,
+            schedule,
         };
 
         if !map.contains_key(subj) {
@@ -148,7 +147,7 @@ fn parse_line(line: &str) -> Result<(&str, &str, &str, &str)> {
     ))
 }
 
-fn parse_sched_table(sched_table: scraper::ElementRef) -> Result<(Vec<Schedule>, HashSet<String>)> {
+fn parse_sched_table(sched_table: scraper::ElementRef) -> Result<(Vec<ScheduleItem>, HashSet<String>)> {
     let mut schedules = Vec::new();
     let mut instructors = HashSet::new();
     let col_sel = Selector::parse(":scope .dddefault")?;
@@ -165,8 +164,8 @@ fn parse_sched_table(sched_table: scraper::ElementRef) -> Result<(Vec<Schedule>,
 
         let days = cols.next().ok_or("days")?.inner_html().decode().trim().chars().collect();
         let location = cols.next().ok_or("location")?.inner_html().decode();
-        schedules.push(Schedule {
-            times: (time_start, time_end),
+        schedules.push(ScheduleItem {
+            time: (time_start, time_end),
             days,
             location,
         });
