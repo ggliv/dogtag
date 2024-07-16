@@ -8,10 +8,7 @@ use std::error::Error;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-pub async fn parse(
-    doc: Html,
-    term: String,
-) -> Result<HashMap<String, Subject>> {
+pub async fn parse(doc: Html, term: String) -> Result<HashMap<String, Subject>> {
     let mut map = HashMap::new();
     let client = Client::builder().gzip(true).build()?;
     let subj_titles = get_subject_titles(&client).await?;
@@ -147,7 +144,9 @@ fn parse_line(line: &str) -> Result<(&str, &str, &str, &str)> {
     ))
 }
 
-fn parse_sched_table(sched_table: scraper::ElementRef) -> Result<(Vec<ScheduleItem>, HashSet<String>)> {
+fn parse_sched_table(
+    sched_table: scraper::ElementRef,
+) -> Result<(Vec<ScheduleItem>, HashSet<String>)> {
     let mut schedules = Vec::new();
     let mut instructors = HashSet::new();
     let col_sel = Selector::parse(":scope .dddefault")?;
@@ -162,8 +161,21 @@ fn parse_sched_table(sched_table: scraper::ElementRef) -> Result<(Vec<ScheduleIt
         let time_start = fix_time(&time_caps[1], &time_caps[2], &time_caps[3])?;
         let time_end = fix_time(&time_caps[4], &time_caps[5], &time_caps[6])?;
 
-        let days = cols.next().ok_or("days")?.inner_html().decode().trim().chars().collect();
-        let location = cols.next().ok_or("location")?.inner_html().decode();
+        let days = cols
+            .next()
+            .ok_or("days")?
+            .inner_html()
+            .decode()
+            .trim()
+            .chars()
+            .collect();
+        let location = cols
+            .next()
+            .ok_or("location")?
+            .text()
+            .next()
+            .ok_or("location text")?
+            .decode();
         schedules.push(ScheduleItem {
             time: (time_start, time_end),
             days,
