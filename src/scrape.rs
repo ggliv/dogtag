@@ -1,62 +1,101 @@
 use crate::structs::*;
 
+use crate::Result;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use regex::Regex;
 use reqwest::Client;
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector};
 use std::collections::{HashMap, HashSet};
-use std::error::Error;
 use std::num::NonZeroU32;
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+pub struct Context {
+    client: Client,
+    governor: Option<DefaultDirectRateLimiter>,
+    config: config::Config,
+}
 
-pub async fn parse(doc: Html, term: String) -> Result<HashMap<String, Subject>> {
+impl Context {
+    pub fn new(config: config::Config) -> Result<Self> {
+        let client = Client::builder().gzip(true).cookie_store(true).build()?;
+        let governor = match config.get_int("per_min_ratelimit") {
+            Ok(rl) if rl.is_positive() => Some(RateLimiter::direct(
+                Quota::per_minute(NonZeroU32::new(rl.try_into()?).unwrap())
+                    .allow_burst(NonZeroU32::new(1).unwrap()),
+            )),
+            _ => None,
+        };
+
+        Ok(Context {
+            client,
+            governor,
+            config,
+        })
+    }
+
+    async fn rate_limit(&self) {
+        if let Some(gov) = &self.governor {
+            gov.until_ready().await
+        }
+    }
+}
+
+pub async fn scrape_doc(ctx: &Context, doc: Html) -> Result<HashMap<String, Subject>> {
     let mut map = HashMap::new();
-    let client = Client::builder().gzip(true).build()?;
-    // rate limit to 1 req per 5 secs
-    let governor = RateLimiter::direct(
-        Quota::per_minute(NonZeroU32::new(120).unwrap()).allow_burst(NonZeroU32::new(1).unwrap()),
-    );
 
-    let subj_titles = get_subject_titles(&client).await?;
+    let subj_titles = get_subject_titles(ctx).await?;
 
     let class_sel = Selector::parse(
         "table[summary='This layout table is used to present the sections found'] > tbody > tr",
     )?;
-    let line_sel = Selector::parse(":scope > th > a")?;
-    let sched_sel = Selector::parse(":scope table[summary='This table lists the scheduled meeting times and assigned instructors for this class..'] > tbody")?;
+
     let mut classes = doc.select(&class_sel);
 
     while let (Some(line), Some(body)) = (classes.next(), classes.next()) {
-        let line = line
-            .select(&line_sel)
-            .next()
-            .ok_or("line find")?
-            .inner_html();
+        let (title, crn, subj, code) = match scrape_line(line) {
+            Ok(r) => r,
+            _ => {
+                log::warn!("Could not parse info line `{}`, skipping", line.html());
+                continue;
+            }
+        };
 
-        let (title, crn, subj, code) = parse_line(&line)?;
-
-        let (schedule, instructors) = match body.select(&sched_sel).next() {
-            Some(sched_table) => parse_sched_table(sched_table)?,
-            None => (Vec::new(), HashSet::new()),
+        // wow this is silly lmao
+        let (schedule, instructors) = match scrape_body(body) {
+            Ok(t) => t,
+            _ => {
+                log::warn!("Could not parse section body for CRN {crn}, skipping");
+                continue;
+            }
         };
 
         let section = Section {
-            crn: crn.parse()?,
+            crn,
             instructors,
             schedule,
         };
 
-        let courses = &mut map.entry(subj.into()).or_insert_with(|| Subject {
-            title: subj_titles.get(subj).cloned(),
-            courses: HashMap::new(),
-        }).courses;
+        if !map.contains_key(&subj) {
+            let subj_title = subj_titles.get(&subj);
 
-        if !courses.contains_key(code) {
-            let (description, credits) =
-                get_course_catalog(&client, &governor, &term, subj, code).await?;
+            if subj_title.is_none() {
+                log::warn!("Subject code {subj} has no available long title, nulling it")
+            }
+
+            map.insert(
+                subj.clone(),
+                Subject {
+                    title: subj_titles.get(&subj).cloned(),
+                    courses: HashMap::new(),
+                },
+            );
+        }
+
+        let courses = &mut map.get_mut(&subj).unwrap().courses;
+
+        if !courses.contains_key(&code) {
+            let (description, credits) = get_course_catalog(ctx, &subj, &code).await?;
             courses.insert(
-                code.into(),
+                code.clone(),
                 Course {
                     title: title.decode(),
                     description: description.decode(),
@@ -66,46 +105,50 @@ pub async fn parse(doc: Html, term: String) -> Result<HashMap<String, Subject>> 
             );
         }
 
-        courses.get_mut(code).unwrap().sections.push(section);
-        log::info!("Done with section of: {subj} {code}");
+        courses.get_mut(&code).unwrap().sections.push(section);
+        log::info!("Finished scraping a section of {subj} {code}");
+    }
+
+    if let Some(_) = classes.next() {
+        log::warn!("Some section tables were not processed")
     }
 
     Ok(map)
 }
 
-pub async fn get_subject_titles(client: &Client) -> Result<HashMap<String, String>> {
+pub async fn get_subject_titles(ctx: &Context) -> Result<HashMap<String, String>> {
     let mut titles = HashMap::new();
 
-    let page = client
-        .get("https://bulletin.uga.edu/coursesHome")
+    ctx.rate_limit().await;
+
+    let page = ctx
+        .client
+        .get(ctx.config.get_string("bulletin_home_url")?)
         .send()
         .await?
         .text()
         .await?;
+
     let doc = Html::parse_document(&page);
     let subjs_sel = Selector::parse("#ddlAllPrefixes > option")?;
 
     for subj in doc.select(&subjs_sel).skip(1) {
         let inner = subj.inner_html();
-        let (code, title) = inner.split_once(" - ").ok_or("subject split")?;
+        let (code, title) = inner.split_once(" - ").ok_or("could not split subjects")?;
         titles.insert(code.into(), title.decode());
     }
 
     Ok(titles)
 }
 
-pub async fn get_course_catalog(
-    client: &Client,
-    governor: &DefaultDirectRateLimiter,
-    term: &str,
-    subj: &str,
-    code: &str,
-) -> Result<(String, (f32, f32))> {
-    governor.until_ready().await;
-    let page = client
-        .get("https://sis-ssb-prod.uga.edu/PROD/bwckctlg.p_disp_course_detail")
+async fn get_course_catalog(ctx: &Context, subj: &str, code: &str) -> Result<(String, (f32, f32))> {
+    ctx.rate_limit().await;
+
+    let page = ctx
+        .client
+        .get(ctx.config.get_string("course_details_url")?)
         .query(&[
-            ("cat_term_in", term),
+            ("cat_term_in", ctx.config.get_string("term")?.as_str()),
             ("subj_code_in", subj),
             ("crse_numb_in", code),
         ])
@@ -113,6 +156,7 @@ pub async fn get_course_catalog(
         .await?
         .text()
         .await?;
+
     let doc = Html::parse_document(&page);
     let body_sel = Selector::parse(
         "table[summary='This table lists the course detail for the selected term.'] td.ntdefault",
@@ -137,25 +181,43 @@ pub async fn get_course_catalog(
     Ok((desc.into(), credits))
 }
 
-fn parse_line(line: &str) -> Result<(&str, &str, &str, &str)> {
+fn scrape_line(line: ElementRef) -> Result<(String, usize, String, String)> {
     let line_re = Regex::new(r"(.*) - (\d{5}) - ([A-Z]{4}) (\d{4}[A-Z]?) - .*")?;
-    let caps = line_re.captures(line).ok_or("line parse")?;
+    let line_sel = Selector::parse(":scope > th > a")?;
+    let line = line
+        .select(&line_sel)
+        .next()
+        .ok_or("line find")?
+        .inner_html();
+
+    let caps = line_re.captures(&line).ok_or("line parse")?;
+
     Ok((
-        caps.get(1).ok_or("line parse")?.as_str(),
-        caps.get(2).ok_or("line parse")?.as_str(),
-        caps.get(3).ok_or("line parse")?.as_str(),
-        caps.get(4).ok_or("line parse")?.as_str(),
+        caps.get(1).ok_or("line parse")?.as_str().to_owned(),
+        caps.get(2).ok_or("line parse")?.as_str().parse()?,
+        caps.get(3).ok_or("line parse")?.as_str().to_owned(),
+        caps.get(4).ok_or("line parse")?.as_str().to_owned(),
     ))
 }
 
-fn parse_sched_table(
-    sched_table: scraper::ElementRef,
-) -> Result<(Vec<ScheduleItem>, HashSet<String>)> {
+fn scrape_body(body: scraper::ElementRef) -> Result<(Vec<ScheduleItem>, HashSet<String>)> {
     let mut schedules = Vec::new();
     let mut instructors = HashSet::new();
+    let sched_sel = Selector::parse(
+        ":scope table[summary=\
+        'This table lists the scheduled meeting times and assigned instructors for this class..'\
+        ] > tbody",
+    )?;
     let col_sel = Selector::parse(":scope .dddefault")?;
     let instr_link_sel = Selector::parse(":scope a")?;
     let time_re = Regex::new(r"(\d?\d):(\d\d) (am|pm) - (\d?\d):(\d\d) (am|pm)")?;
+
+    let sched_table = match body .select(&sched_sel) .next() {
+        Some(t) => t,
+        _ => {
+            return Ok((Vec::new(), HashSet::new()));
+        }
+    };
 
     for row in sched_table.select(&Selector::parse(":scope tr")?).skip(1) {
         let mut cols = row.select(&col_sel).skip(1);
@@ -163,7 +225,7 @@ fn parse_sched_table(
         let time_tup = match time {
             "TBA" => None,
             _ => Some({
-                let time_caps = time_re.captures(&time).ok_or("time parse")?;
+                let time_caps = time_re.captures(time).ok_or("time parse")?;
 
                 let time_start = fix_time(&time_caps[1], &time_caps[2], &time_caps[3])?;
                 let time_end = fix_time(&time_caps[4], &time_caps[5], &time_caps[6])?;
