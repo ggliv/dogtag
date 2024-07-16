@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Subject {
-    pub title: String,
+    pub title: Option<String>,
     pub courses: HashMap<String, Course>,
 }
 
@@ -24,7 +24,7 @@ pub struct Section {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScheduleItem {
-    pub time: (String, String),
+    pub time: Option<(String, String)>,
     pub days: Vec<char>,
-    pub location: String,
+    pub location: Option<String>,
 }

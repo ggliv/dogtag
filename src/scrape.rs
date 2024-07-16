@@ -1,9 +1,9 @@
 use crate::structs::*;
 
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use regex::Regex;
 use reqwest::Client;
 use scraper::{Html, Selector};
-use governor::{RateLimiter, Quota, DefaultDirectRateLimiter};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::num::NonZeroU32;
@@ -13,7 +13,10 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 pub async fn parse(doc: Html, term: String) -> Result<HashMap<String, Subject>> {
     let mut map = HashMap::new();
     let client = Client::builder().gzip(true).build()?;
-    let governor = RateLimiter::direct(Quota::per_second(NonZeroU32::new(2).unwrap()));
+    // rate limit to 1 req per 5 secs
+    let governor = RateLimiter::direct(
+        Quota::per_minute(NonZeroU32::new(120).unwrap()).allow_burst(NonZeroU32::new(1).unwrap()),
+    );
 
     let subj_titles = get_subject_titles(&client).await?;
 
@@ -44,25 +47,19 @@ pub async fn parse(doc: Html, term: String) -> Result<HashMap<String, Subject>> 
             schedule,
         };
 
-        if !map.contains_key(subj) {
-            map.insert(
-                subj.into(),
-                Subject {
-                    title: subj_titles.get(subj).ok_or("unknown subject")?.into(),
-                    courses: HashMap::new(),
-                },
-            );
-        }
-
-        let courses = &mut map.get_mut(subj).unwrap().courses;
+        let courses = &mut map.entry(subj.into()).or_insert_with(|| Subject {
+            title: subj_titles.get(subj).cloned(),
+            courses: HashMap::new(),
+        }).courses;
 
         if !courses.contains_key(code) {
-            let (description, credits) = get_course_catalog(&client, &governor, &term, subj, code).await?;
+            let (description, credits) =
+                get_course_catalog(&client, &governor, &term, subj, code).await?;
             courses.insert(
                 code.into(),
                 Course {
-                    title: title.into(),
-                    description,
+                    title: title.decode(),
+                    description: description.decode(),
                     credits,
                     sections: Vec::new(),
                 },
@@ -70,6 +67,7 @@ pub async fn parse(doc: Html, term: String) -> Result<HashMap<String, Subject>> 
         }
 
         courses.get_mut(code).unwrap().sections.push(section);
+        log::info!("Done with section of: {subj} {code}");
     }
 
     Ok(map)
@@ -90,7 +88,7 @@ pub async fn get_subject_titles(client: &Client) -> Result<HashMap<String, Strin
     for subj in doc.select(&subjs_sel).skip(1) {
         let inner = subj.inner_html();
         let (code, title) = inner.split_once(" - ").ok_or("subject split")?;
-        titles.insert(code.into(), title.into());
+        titles.insert(code.into(), title.decode());
     }
 
     Ok(titles)
@@ -161,11 +159,17 @@ fn parse_sched_table(
 
     for row in sched_table.select(&Selector::parse(":scope tr")?).skip(1) {
         let mut cols = row.select(&col_sel).skip(1);
-        let time = cols.next().ok_or("time")?.inner_html();
-        let time_caps = time_re.captures(&time).ok_or("time parse")?;
+        let time = cols.next().ok_or("time")?.text().next().ok_or("time")?;
+        let time_tup = match time {
+            "TBA" => None,
+            _ => Some({
+                let time_caps = time_re.captures(&time).ok_or("time parse")?;
 
-        let time_start = fix_time(&time_caps[1], &time_caps[2], &time_caps[3])?;
-        let time_end = fix_time(&time_caps[4], &time_caps[5], &time_caps[6])?;
+                let time_start = fix_time(&time_caps[1], &time_caps[2], &time_caps[3])?;
+                let time_end = fix_time(&time_caps[4], &time_caps[5], &time_caps[6])?;
+                (time_start, time_end)
+            }),
+        };
 
         let days = cols
             .next()
@@ -183,9 +187,12 @@ fn parse_sched_table(
             .ok_or("location text")?
             .decode();
         schedules.push(ScheduleItem {
-            time: (time_start, time_end),
+            time: time_tup,
             days,
-            location,
+            location: match location.as_str() {
+                "TBA" => None,
+                _ => Some(location),
+            },
         });
 
         cols.next().ok_or("date range")?;
