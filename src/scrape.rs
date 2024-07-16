@@ -153,15 +153,20 @@ fn parse_sched_table(sched_table: scraper::ElementRef) -> Result<(Vec<Schedule>,
     let mut instructors = HashSet::new();
     let col_sel = Selector::parse(":scope .dddefault")?;
     let instr_link_sel = Selector::parse(":scope a")?;
+    let time_re = Regex::new(r"(\d?\d):(\d\d) (am|pm) - (\d?\d):(\d\d) (am|pm)")?;
 
     for row in sched_table.select(&Selector::parse(":scope tr")?).skip(1) {
         let mut cols = row.select(&col_sel).skip(1);
         let time = cols.next().ok_or("time")?.inner_html();
-        let (time_start, time_end) = time.split_once(" - ").ok_or("time split")?;
+        let time_caps = time_re.captures(&time).ok_or("time parse")?;
+
+        let time_start = fix_time(&time_caps[1], &time_caps[2], &time_caps[3])?;
+        let time_end = fix_time(&time_caps[4], &time_caps[5], &time_caps[6])?;
+
         let days = cols.next().ok_or("days")?.inner_html().decode();
         let location = cols.next().ok_or("location")?.inner_html().decode();
         schedules.push(Schedule {
-            times: (time_start.into(), time_end.into()),
+            times: (time_start, time_end),
             days,
             location,
         });
@@ -174,6 +179,13 @@ fn parse_sched_table(sched_table: scraper::ElementRef) -> Result<(Vec<Schedule>,
     }
 
     Ok((schedules, instructors))
+}
+
+fn fix_time(hrs: &str, mins: &str, period: &str) -> Result<String> {
+    Ok(match period {
+        "pm" if hrs != "12" => format!("{:0>2}:{mins}", hrs.parse::<usize>()? + 12),
+        _ => format!("{hrs:0>2}:{mins}"),
+    })
 }
 
 trait DecodeHtmlEntities {
