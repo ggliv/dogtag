@@ -101,7 +101,7 @@ pub async fn get_course_catalog(
     term: &str,
     subj: &str,
     code: &str,
-) -> Result<(String, (String, String))> {
+) -> Result<(String, (f32, f32))> {
     let page = client
         .get("https://sis-ssb-prod.uga.edu/PROD/bwckctlg.p_disp_course_detail")
         .query(&[
@@ -126,9 +126,9 @@ pub async fn get_course_catalog(
         let cred_range_re = Regex::new(r".*(\d+\.\d+)\s+TO\s+(\d+\.\d+) Credit hours.*")?;
         let cred_single_re = Regex::new(r".*(\d+\.\d+)\s+Credit hours.*")?;
         if let Some(caps) = cred_range_re.captures(cred_line) {
-            (caps[1].into(), caps[2].into())
+            (caps[1].parse::<f32>()?, caps[2].parse::<f32>()?)
         } else if let Some(caps) = cred_single_re.captures(cred_line) {
-            (caps[1].into(), caps[1].into())
+            (caps[1].parse::<f32>()?, caps[1].parse::<f32>()?)
         } else {
             Err("credits: no match")?
         }

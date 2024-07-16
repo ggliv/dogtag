@@ -63,3 +63,6 @@ cargo run
    "...":"etc"
 }
 ```
+
+## TODO
+- ratelimiting requests to the catalog

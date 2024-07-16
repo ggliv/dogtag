@@ -11,7 +11,7 @@ pub struct Subject {
 pub struct Course {
     pub title: String,
     pub description: String,
-    pub credits: (String, String),
+    pub credits: (f32, f32),
     pub sections: Vec<Section>,
 }
 
