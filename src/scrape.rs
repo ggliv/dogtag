@@ -3,14 +3,18 @@ use crate::structs::*;
 use regex::Regex;
 use reqwest::Client;
 use scraper::{Html, Selector};
+use governor::{RateLimiter, Quota, DefaultDirectRateLimiter};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::num::NonZeroU32;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 pub async fn parse(doc: Html, term: String) -> Result<HashMap<String, Subject>> {
     let mut map = HashMap::new();
     let client = Client::builder().gzip(true).build()?;
+    let governor = RateLimiter::direct(Quota::per_second(NonZeroU32::new(2).unwrap()));
+
     let subj_titles = get_subject_titles(&client).await?;
 
     let class_sel = Selector::parse(
@@ -53,7 +57,7 @@ pub async fn parse(doc: Html, term: String) -> Result<HashMap<String, Subject>> 
         let courses = &mut map.get_mut(subj).unwrap().courses;
 
         if !courses.contains_key(code) {
-            let (description, credits) = get_course_catalog(&client, &term, subj, code).await?;
+            let (description, credits) = get_course_catalog(&client, &governor, &term, subj, code).await?;
             courses.insert(
                 code.into(),
                 Course {
@@ -94,10 +98,12 @@ pub async fn get_subject_titles(client: &Client) -> Result<HashMap<String, Strin
 
 pub async fn get_course_catalog(
     client: &Client,
+    governor: &DefaultDirectRateLimiter,
     term: &str,
     subj: &str,
     code: &str,
 ) -> Result<(String, (f32, f32))> {
+    governor.until_ready().await;
     let page = client
         .get("https://sis-ssb-prod.uga.edu/PROD/bwckctlg.p_disp_course_detail")
         .query(&[
