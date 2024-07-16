@@ -14,14 +14,15 @@ pub async fn parse(
     //subject_titles: HashMap<String, String>,
 ) -> Result<HashMap<String, Subject>> {
     let mut map = HashMap::new();
+    let client = Client::builder().gzip(true).build()?;
+    let subj_titles = get_subject_titles(&client).await?;
+
     let class_sel = Selector::parse(
         "table[summary='This layout table is used to present the sections found'] > tbody > tr",
     )?;
     let line_sel = Selector::parse(":scope > th > a")?;
     let sched_sel = Selector::parse(":scope table[summary='This table lists the scheduled meeting times and assigned instructors for this class..'] > tbody")?;
     let mut classes = doc.select(&class_sel);
-
-    let client = Client::builder().gzip(true).build()?;
 
     while let (Some(line), Some(body)) = (classes.next(), classes.next()) {
         let line = line
@@ -43,34 +44,56 @@ pub async fn parse(
             schedules,
         };
 
-        let courses = &mut map.entry(subj.into())
-            .or_insert_with(|| {
+        if !map.contains_key(subj) {
+            map.insert(
+                subj.into(),
                 Subject {
-                    // TODO use actual subject title
-                    title: String::new(),
+                    title: subj_titles.get(subj).ok_or("unknown subject")?.into(),
                     courses: HashMap::new(),
-                }
-            })
-            .courses;
+                },
+            );
+        }
 
-        // we have to do this instead of the more elegant element(...).or_insert_with(...)
-        // because of our async catalog request
+        let courses = &mut map.get_mut(subj).unwrap().courses;
+
         if !courses.contains_key(code) {
             let (description, credits) = get_course_catalog(&client, &term, subj, code).await?;
-            courses.insert(code.into(), Course {
+            courses.insert(
+                code.into(),
+                Course {
                     title: title.into(),
                     description,
                     credits,
                     sections: Vec::new(),
-                });
+                },
+            );
         }
 
-        courses.get_mut(code).unwrap()
-            .sections
-            .push(section);
+        courses.get_mut(code).unwrap().sections.push(section);
     }
 
     Ok(map)
+}
+
+pub async fn get_subject_titles(client: &Client) -> Result<HashMap<String, String>> {
+    let mut titles = HashMap::new();
+
+    let page = client
+        .get("https://bulletin.uga.edu/coursesHome")
+        .send()
+        .await?
+        .text()
+        .await?;
+    let doc = Html::parse_document(&page);
+    let subjs_sel = Selector::parse("#ddlAllPrefixes > option")?;
+
+    for subj in doc.select(&subjs_sel).skip(1) {
+        let inner = subj.inner_html();
+        let (code, title) = inner.split_once(" - ").ok_or("subject split")?;
+        titles.insert(code.into(), title.into());
+    }
+
+    Ok(titles)
 }
 
 pub async fn get_course_catalog(
