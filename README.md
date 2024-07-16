@@ -66,3 +66,4 @@ cargo run
 
 ## TODO
 - ratelimiting requests to the catalog
+- use detailed course listing [like this](https://sis-ssb-prod.uga.edu/PROD/bwckschd.p_disp_detail_sched?term_in=202408&crn_in=61253)
