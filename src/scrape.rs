@@ -163,7 +163,7 @@ fn parse_sched_table(sched_table: scraper::ElementRef) -> Result<(Vec<Schedule>,
         let time_start = fix_time(&time_caps[1], &time_caps[2], &time_caps[3])?;
         let time_end = fix_time(&time_caps[4], &time_caps[5], &time_caps[6])?;
 
-        let days = cols.next().ok_or("days")?.inner_html().decode();
+        let days = cols.next().ok_or("days")?.inner_html().decode().trim().chars().collect();
         let location = cols.next().ok_or("location")?.inner_html().decode();
         schedules.push(Schedule {
             times: (time_start, time_end),

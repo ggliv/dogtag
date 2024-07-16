@@ -25,6 +25,6 @@ pub struct Section {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Schedule {
     pub times: (String, String),
-    pub days: String,
+    pub days: Vec<char>,
     pub location: String,
 }
