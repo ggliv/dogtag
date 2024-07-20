@@ -8,14 +8,21 @@ use scraper::{ElementRef, Html, Selector};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 
-pub struct Context {
+pub async fn go(config: config::Config, previous_scrape: Option<HashMap<String, Subject>>) -> Result<HashMap<String, Subject>> {
+    let ctx = Context::new(config)?;
+    let subjs = get_subject_titles(&ctx).await?;
+    let sections_doc = get_sections_doc(&ctx, subjs.keys().map(|s| s.as_str())).await?;
+    Ok(scrape_doc(&ctx, sections_doc, subjs, previous_scrape).await?)
+}
+
+struct Context {
     client: Client,
     governor: Option<DefaultDirectRateLimiter>,
     config: config::Config,
 }
 
 impl Context {
-    pub fn new(config: config::Config) -> Result<Self> {
+    fn new(config: config::Config) -> Result<Self> {
         let client = Client::builder().gzip(true).cookie_store(true).build()?;
         let governor = match config.get_int("per_min_ratelimit") {
             Ok(rl) if rl.is_positive() => Some(RateLimiter::direct(
@@ -34,15 +41,72 @@ impl Context {
 
     async fn rate_limit(&self) {
         if let Some(gov) = &self.governor {
+            log::info!("Waiting for rate limit...");
             gov.until_ready().await
         }
     }
 }
 
-pub async fn scrape_doc(ctx: &Context, doc: Html) -> Result<HashMap<String, Subject>> {
-    let mut map = HashMap::new();
+async fn get_sections_doc(ctx: &Context, subjs: impl Iterator<Item = &str>) -> Result<Html> {
+    let url = ctx.config.get_string("course_sched_url")?;
+    let term = ctx.config.get_string("term")?;
 
-    let subj_titles = get_subject_titles(ctx).await?;
+    let subjs: Vec<(&str, &str)> = std::iter::repeat("sel_subj").zip(subjs).collect();
+
+    ctx.rate_limit().await;
+
+    log::info!("Requesting page with all sections (this will take a while)");
+
+    let sections_page = ctx
+        .client
+        .post(url)
+        .query(&[
+            ("term_in", term.as_str()),
+            ("sel_subj", "dummy"),
+            ("sel_day", "dummy"),
+            ("sel_schd", "dummy"),
+            ("sel_insm", "dummy"),
+            ("sel_camp", "dummy"),
+            ("sel_levl", "dummy"),
+            ("sel_sess", "dummy"),
+            ("sel_instr", "dummy"),
+            ("sel_ptrm", "dummy"),
+            ("sel_attr", "dummy"),
+        ])
+        .query(subjs.as_slice())
+        .query(&[
+            ("sel_crse", ""),
+            ("sel_title", ""),
+            ("sel_schd", "%"),
+            ("sel_from_cred", ""),
+            ("sel_to_cred", ""),
+            ("sel_camp", "%"),
+            ("sel_levl", "%"),
+            ("sel_ptrm", "%"),
+            ("sel_instr", "%"),
+            ("sel_attr", "%"),
+            ("begin_hh", "0"),
+            ("begin_mi", "0"),
+            ("begin_ap", "a"),
+            ("end_hh", "0"),
+            ("end_mi", "0"),
+            ("end_ap", "a"),
+        ])
+        .send()
+        .await?
+        .text()
+        .await?;
+
+    Ok(scraper::Html::parse_document(&sections_page))
+}
+
+async fn scrape_doc(
+    ctx: &Context,
+    doc: Html,
+    subjs: HashMap<String, String>,
+    previous_scrape: Option<HashMap<String, Subject>>,
+) -> Result<HashMap<String, Subject>> {
+    let mut map = HashMap::new();
 
     let class_sel = Selector::parse(
         "table[summary='This layout table is used to present the sections found'] > tbody > tr",
@@ -75,7 +139,7 @@ pub async fn scrape_doc(ctx: &Context, doc: Html) -> Result<HashMap<String, Subj
         };
 
         if !map.contains_key(&subj) {
-            let subj_title = subj_titles.get(&subj);
+            let subj_title = subjs.get(&subj);
 
             if subj_title.is_none() {
                 log::warn!("Subject code {subj} has no available long title, nulling it")
@@ -84,7 +148,7 @@ pub async fn scrape_doc(ctx: &Context, doc: Html) -> Result<HashMap<String, Subj
             map.insert(
                 subj.clone(),
                 Subject {
-                    title: subj_titles.get(&subj).cloned(),
+                    title: subjs.get(&subj).cloned(),
                     courses: HashMap::new(),
                 },
             );
@@ -93,7 +157,19 @@ pub async fn scrape_doc(ctx: &Context, doc: Html) -> Result<HashMap<String, Subj
         let courses = &mut map.get_mut(&subj).unwrap().courses;
 
         if !courses.contains_key(&code) {
-            let (description, credits) = get_course_catalog(ctx, &subj, &code).await?;
+            let cached = previous_scrape.as_ref().and_then(|m| {
+                m.get(&subj).and_then(|s| {
+                    s.courses
+                        .get(&code)
+                        .and_then(|c| Some((c.description.to_owned(), c.credits.to_owned())))
+                })
+            });
+
+            let (description, credits) = match cached {
+                Some(v) => v,
+                None => get_course_catalog(ctx, &subj, &code).await?,
+            };
+
             courses.insert(
                 code.clone(),
                 Course {
@@ -116,11 +192,49 @@ pub async fn scrape_doc(ctx: &Context, doc: Html) -> Result<HashMap<String, Subj
     Ok(map)
 }
 
-pub async fn get_subject_titles(ctx: &Context) -> Result<HashMap<String, String>> {
+async fn get_subject_titles(ctx: &Context) -> Result<HashMap<String, String>> {
     let mut titles = HashMap::new();
+    let subj_re = Regex::new(r"([A-Z]{4})\s*[-–]\s*(.*)")?;
+
+    let parse_subj_option = |e: ElementRef| -> Result<(String, String)> {
+        let inner = e.inner_html();
+        let groups = subj_re
+            .captures(&inner)
+            .ok_or_else(|| format!("Could not parse subject: {inner}"))?;
+        Ok((groups[1].into(), groups[2].decode()))
+    };
 
     ctx.rate_limit().await;
 
+    // first, get titles from the course search page.
+    // this should include all the subjects we'll encounter,
+    // but some of the titles are shortened.
+    let page = ctx
+        .client
+        .post(ctx.config.get_string("course_search_url")?)
+        .query(&[
+            ("p_calling_proc", "bwckschd.p_disp_dyn_sched"),
+            ("p_term", &ctx.config.get_string("term")?),
+        ])
+        .send()
+        .await?
+        .text()
+        .await?;
+
+    let doc = Html::parse_document(&page);
+    let subjs_sel = Selector::parse("#subj_id > option")?;
+
+    for subj in doc.select(&subjs_sel) {
+        let (code, title) = parse_subj_option(subj)?;
+        titles.insert(code, title);
+    }
+
+    ctx.rate_limit().await;
+
+    // next, get titles from the bulletin. this
+    // won't necessarily have all of the courses
+    // we'll encounter, but the titles are full
+    // (as in, not abbreviated)
     let page = ctx
         .client
         .get(ctx.config.get_string("bulletin_home_url")?)
@@ -133,9 +247,10 @@ pub async fn get_subject_titles(ctx: &Context) -> Result<HashMap<String, String>
     let subjs_sel = Selector::parse("#ddlAllPrefixes > option")?;
 
     for subj in doc.select(&subjs_sel).skip(1) {
-        let inner = subj.inner_html();
-        let (code, title) = inner.split_once(" - ").ok_or("could not split subjects")?;
-        titles.insert(code.into(), title.decode());
+        let (code, title) = parse_subj_option(subj)?;
+        if titles.contains_key(&code) {
+            titles.insert(code, title);
+        }
     }
 
     Ok(titles)
@@ -212,7 +327,7 @@ fn scrape_body(body: scraper::ElementRef) -> Result<(Vec<ScheduleItem>, HashSet<
     let instr_link_sel = Selector::parse(":scope a")?;
     let time_re = Regex::new(r"(\d?\d):(\d\d) (am|pm) - (\d?\d):(\d\d) (am|pm)")?;
 
-    let sched_table = match body .select(&sched_sel) .next() {
+    let sched_table = match body.select(&sched_sel).next() {
         Some(t) => t,
         _ => {
             return Ok((Vec::new(), HashSet::new()));
