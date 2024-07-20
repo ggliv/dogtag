@@ -355,6 +355,16 @@ fn scrape_body(body: scraper::ElementRef) -> Result<(Vec<ScheduleItem>, HashSet<
             .decode()
             .trim()
             .chars()
+            .filter_map(|d| match d {
+                'M' => Some(1),
+                'T' => Some(2),
+                'W' => Some(3),
+                'R' => Some(4),
+                'F' => Some(5),
+                'S' => Some(6),
+                'U' => Some(7),
+                _ => None,
+            })
             .collect();
         let location = cols
             .next()

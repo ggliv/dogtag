@@ -25,6 +25,6 @@ pub struct Section {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScheduleItem {
     pub time: Option<(String, String)>,
-    pub days: Vec<char>,
+    pub days: Vec<u8>,
     pub location: Option<String>,
 }
