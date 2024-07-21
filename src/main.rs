@@ -30,12 +30,10 @@ async fn main() -> Result<()> {
         .build()?;
 
     let previous_scrape = config.get_string("previous_scrape").ok().and_then(|v| {
-        Some(
-            serde_json::from_str::<std::collections::HashMap<String, structs::Subject>>(
-                &std::fs::read_to_string(v).ok()?,
-            )
-            .ok()?,
+        serde_json::from_str::<std::collections::HashMap<String, structs::Subject>>(
+            &std::fs::read_to_string(v).ok()?,
         )
+        .ok()
     });
 
     let res = scrape::go(config, previous_scrape).await?;

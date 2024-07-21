@@ -8,11 +8,14 @@ use scraper::{ElementRef, Html, Selector};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 
-pub async fn go(config: config::Config, previous_scrape: Option<HashMap<String, Subject>>) -> Result<HashMap<String, Subject>> {
+pub async fn go(
+    config: config::Config,
+    previous_scrape: Option<HashMap<String, Subject>>,
+) -> Result<HashMap<String, Subject>> {
     let ctx = Context::new(config)?;
     let subjs = get_subject_titles(&ctx).await?;
     let sections_doc = get_sections_doc(&ctx, subjs.keys().map(|s| s.as_str())).await?;
-    Ok(scrape_doc(&ctx, sections_doc, subjs, previous_scrape).await?)
+    scrape_doc(&ctx, sections_doc, subjs, previous_scrape).await
 }
 
 struct Context {
@@ -161,7 +164,7 @@ async fn scrape_doc(
                 m.get(&subj).and_then(|s| {
                     s.courses
                         .get(&code)
-                        .and_then(|c| Some((c.description.to_owned(), c.credits.to_owned())))
+                        .map(|c| (c.description.to_owned(), c.credits.to_owned()))
                 })
             });
 
@@ -185,7 +188,7 @@ async fn scrape_doc(
         log::info!("Finished scraping a section of {subj} {code}");
     }
 
-    if let Some(_) = classes.next() {
+    if classes.next().is_some() {
         log::warn!("Some section tables were not processed")
     }
 
